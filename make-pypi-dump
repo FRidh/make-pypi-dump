@@ -1,36 +1,36 @@
-#!/usr/bin/env nix-shell
-#!nix-shell -i python3 -p 'python3.withPackages(ps: with ps; [ aiohttp])'
+#!/usr/bin/env python3
 
 # stlib
 import argparse
 import asyncio
+import datetime
 import json
 import logging
 import os
+import string
 from xmlrpc.client import ServerProxy
+from concurrent.futures import ThreadPoolExecutor
 
 # external dependencies
 import aiohttp
 
-
 INDEX = "https://pypi.org/pypi"
 """PyPI server index."""
 
-NSEMAPHORE = 200
+NSEMAPHORE = 5
 """Maximum amount of concurrent requests"""
 
-NCHARACTERS = 1
-"""Group the packages on the first characters"""
-
-NTIMEOUT = 2
+NTIMEOUT = 1.0
 """Timeout in seconds"""
 
 FOLDER_DATA = 'json'
 
-FILE_TIMESTAMP = os.path.join("timestamp")
+FILE_STATE = "state.json"
+
+logging.basicConfig(level=logging.INFO)
 
 
-def retrieve_packages_changelog(index=INDEX, timestamp=0):
+def retrieve_packages_changelog(index=INDEX, timestamp=None):
     """Obtain names of packages that have updated since we last checked PyPI.
 
     :param index: url with packages index. By default `INDEX` is used.
@@ -38,40 +38,59 @@ def retrieve_packages_changelog(index=INDEX, timestamp=0):
 
     :returns: List of packages.
     """
-    with ServerProxy(index) as client:
-        # List of tuples with changes.
-        # The last change is the last item in the list.
-        # Tuple of (package name, version, timestamp, event)
-        # If changelog is passed True as second argument
-        # a fifth item is added, serial.
-        changes = client.changelog(timestamp)
-    timestamp_last_update = changes[-1][2]
-    packages = sorted(list(set([x[0] for x in changes])))
-    return packages, timestamp_last_update
+    if timestamp is None:
+        with ServerProxy(index) as client:
+            packages = client.list_packages()
+            timestamp = datetime.datetime.now().timestamp()
+    else:
+        with ServerProxy(index) as client:
+            # List of tuples with changes.
+            # The last change is the last item in the list.
+            # Tuple of (package name, version, timestamp, event)
+            # If changelog is passed True as second argument
+            # a fifth item is added, serial.
+            changes = client.changelog(timestamp)
+        timestamp = changes[-1][2]
+        packages = sorted(list(set([x[0] for x in changes])))
+
+    return packages, timestamp
 
 
-async def _fetch_and_write(session, sem, folder, index, package):
+async def _fetch_page(session, semaphore, index, package):
     """Fetch page asynchronously.
 
     :param session: Session of client
     :param url: Requested url
     """
-    async with sem:
-        url = "{}/{}/json".format(index, package)
-        print(url)
+    url = "{}/{}/json".format(index, package)
+    async with semaphore:
         async with session.get(url) as response:
             with aiohttp.Timeout(NTIMEOUT):
                 async with session.get(url) as response:
                     assert response.status == 200
                     return await response.json()
-                    #_write_package(folder, package, data)
-                    #logging.debug("Finished with {}".format(package))
 
+
+def _write_package(folder, package, data):
+    """Write JSON to file."""
+    # We group files on first character of name.
+    #first_characters = package[:NCHARACTERS]
+    #if not os.path.exists(os.path.join(folder, first_characters)):
+        #os.makedirs(os.path.join(folder, first_characters))
+
+    with open(os.path.join(folder, "{}.json".format(package)), 'w') as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+
+async def _retrieve_and_write(session, semaphore, index, folder, package):
+    json = await _fetch_page(session, semaphore, index, package)
+    _write_package(folder, package, json)
+    logging.debug("Finished with {}".format(package))
 
 async def _all(session, semaphore, index, folder, packages):
-    tasks = [ asyncio.ensure_future(_fetch_and_write(session, semaphore, folder, index, package)) for package in packages]
+    tasks = [ asyncio.ensure_future(_retrieve_and_write(session, semaphore, index, folder, package)) for package in packages]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     return results
+
 
 def _get_and_write_data(folder, packages, index=INDEX):
     """Yield JSON information obtained from PyPI index given an iterable of package names.
@@ -84,53 +103,70 @@ def _get_and_write_data(folder, packages, index=INDEX):
     with aiohttp.ClientSession(loop=loop, connector=connector) as session:
         tasks = []
         sem = asyncio.Semaphore(NSEMAPHORE)
-        result = loop.run_until_complete(_all(session, sem, index, folder, packages))
-        print(result)
+        results = loop.run_until_complete(_all(session, sem, index, folder, packages))
         logging.info("Finished retrieved JSON from PyPI")
     loop.close()
+    return zip(packages, results)
 
-
-def dump(destination, inplace=False, index=INDEX):
-
-    # Create destination root folder.
-    if os.path.exists(destination) and not inplace:
-        raise FileExistsError(destination)
+def makefolder(destination, update):
+    if os.path.exists(destination):
+        if not update:
+            raise FileExistsError(destination)
     else:
         os.makedirs(destination)
 
-    # Check whether we update JSON file or create new one.
-    update = os.path.isfile(os.path.join(destination, FILE_TIMESTAMP))
+def dump(destination, update=False, index=INDEX):
+
+    # Create destination root folder.
+    makefolder(destination, update)
+
+    # Get initial state
+    if update:
+        with open(os.path.join(destination, FILE_STATE), 'r') as f:
+            state = json.load(f)
+    else:
+        state = {
+            'timestamp' :   None,
+            'failed'  :   [],
+        }
 
     # Obtain list of packages to update/retrieve
-    if update:
-        with open(os.path.join(destination, FILE_TIMESTAMP), 'r') as f:
-            timestamp = float(f.readline())
-    else:
-        timestamp = 0
-    packages, timestamp = retrieve_packages_changelog(INDEX, timestamp)
+    packages, timestamp = retrieve_packages_changelog(INDEX, state['timestamp'])
 
-    with open(os.path.join(destination, FILE_TIMESTAMP), 'w') as f:
-        f.write(str(timestamp))
+    # Include packages that could not be retrieved last time.
+    packages = sorted(list(set(packages+state['failed'])))
 
     npackages = len(packages)
     logging.info("Updating {} packages.".format(npackages))
-    _get_and_write_data(os.path.join(destination, FOLDER_DATA), packages, index)
+
+    # Create destination data folder.
+    data_folder = os.path.join(destination, FOLDER_DATA)
+    makefolder(data_folder, update)
+
+    # List of tuples. First element is package name, and the second None or an exception.
+    results = _get_and_write_data(data_folder, packages, index)
+
+    failed = list(map(lambda r: r[0], filter(lambda r: isinstance(r[1], Exception), results)))
+    del results
+
+    # State that we record.
+    state = {
+        'timestamp' :   timestamp,
+        'failed'    :   failed
+    }
+
+    with open(os.path.join(destination, FILE_STATE), 'w') as f:
+        json.dump(state, f, indent=2, sort_keys=True)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('destination', type=str)
-    #parser.add_argument('source', type=str, default=None, help='')
+    parser.add_argument('--update', action='store_true')
 
     args = parser.parse_args()
 
-    #if args.destination is None:
-        #destination = source
-    #del args
-
-    dump(args.destination)
-
-
+    dump(args.destination, args.update)
 
 
 
