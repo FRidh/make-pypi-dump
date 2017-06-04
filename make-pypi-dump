@@ -1,0 +1,138 @@
+#!/usr/bin/env nix-shell
+#!nix-shell -i python3 -p 'python3.withPackages(ps: with ps; [ aiohttp])'
+
+# stlib
+import argparse
+import asyncio
+import json
+import logging
+import os
+from xmlrpc.client import ServerProxy
+
+# external dependencies
+import aiohttp
+
+
+INDEX = "https://pypi.org/pypi"
+"""PyPI server index."""
+
+NSEMAPHORE = 200
+"""Maximum amount of concurrent requests"""
+
+NCHARACTERS = 1
+"""Group the packages on the first characters"""
+
+NTIMEOUT = 2
+"""Timeout in seconds"""
+
+FOLDER_DATA = 'json'
+
+FILE_TIMESTAMP = os.path.join("timestamp")
+
+
+def retrieve_packages_changelog(index=INDEX, timestamp=0):
+    """Obtain names of packages that have updated since we last checked PyPI.
+
+    :param index: url with packages index. By default `INDEX` is used.
+    :param timestamp: UTC timestamp. By default we use 0.
+
+    :returns: List of packages.
+    """
+    with ServerProxy(index) as client:
+        # List of tuples with changes.
+        # The last change is the last item in the list.
+        # Tuple of (package name, version, timestamp, event)
+        # If changelog is passed True as second argument
+        # a fifth item is added, serial.
+        changes = client.changelog(timestamp)
+    timestamp_last_update = changes[-1][2]
+    packages = sorted(list(set([x[0] for x in changes])))
+    return packages, timestamp_last_update
+
+
+async def _fetch_and_write(session, sem, folder, index, package):
+    """Fetch page asynchronously.
+
+    :param session: Session of client
+    :param url: Requested url
+    """
+    async with sem:
+        url = "{}/{}/json".format(index, package)
+        print(url)
+        async with session.get(url) as response:
+            with aiohttp.Timeout(NTIMEOUT):
+                async with session.get(url) as response:
+                    assert response.status == 200
+                    return await response.json()
+                    #_write_package(folder, package, data)
+                    #logging.debug("Finished with {}".format(package))
+
+
+async def _all(session, semaphore, index, folder, packages):
+    tasks = [ asyncio.ensure_future(_fetch_and_write(session, semaphore, folder, index, package)) for package in packages]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    return results
+
+def _get_and_write_data(folder, packages, index=INDEX):
+    """Yield JSON information obtained from PyPI index given an iterable of package names.
+
+    :param packages: Iterable of package names.
+    :param index: url with packages index. By default `INDEX` is used.
+    """
+    loop = asyncio.get_event_loop()
+    connector = aiohttp.TCPConnector(loop=loop)
+    with aiohttp.ClientSession(loop=loop, connector=connector) as session:
+        tasks = []
+        sem = asyncio.Semaphore(NSEMAPHORE)
+        result = loop.run_until_complete(_all(session, sem, index, folder, packages))
+        print(result)
+        logging.info("Finished retrieved JSON from PyPI")
+    loop.close()
+
+
+def dump(destination, inplace=False, index=INDEX):
+
+    # Create destination root folder.
+    if os.path.exists(destination) and not inplace:
+        raise FileExistsError(destination)
+    else:
+        os.makedirs(destination)
+
+    # Check whether we update JSON file or create new one.
+    update = os.path.isfile(os.path.join(destination, FILE_TIMESTAMP))
+
+    # Obtain list of packages to update/retrieve
+    if update:
+        with open(os.path.join(destination, FILE_TIMESTAMP), 'r') as f:
+            timestamp = float(f.readline())
+    else:
+        timestamp = 0
+    packages, timestamp = retrieve_packages_changelog(INDEX, timestamp)
+
+    with open(os.path.join(destination, FILE_TIMESTAMP), 'w') as f:
+        f.write(str(timestamp))
+
+    npackages = len(packages)
+    logging.info("Updating {} packages.".format(npackages))
+    _get_and_write_data(os.path.join(destination, FOLDER_DATA), packages, index)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('destination', type=str)
+    #parser.add_argument('source', type=str, default=None, help='')
+
+    args = parser.parse_args()
+
+    #if args.destination is None:
+        #destination = source
+    #del args
+
+    dump(args.destination)
+
+
+
+
+
+if __name__ == '__main__':
+    main()
