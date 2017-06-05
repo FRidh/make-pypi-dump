@@ -64,11 +64,9 @@ async def _fetch_page(session, semaphore, index, package):
     """
     url = "{}/{}/json".format(index, package)
     async with semaphore:
-        async with session.get(url) as response:
-            with aiohttp.Timeout(NTIMEOUT):
-                async with session.get(url) as response:
-                    assert response.status == 200
-                    return await response.json()
+        async with session.get(url, timeout=NTIMEOUT) as response:
+            assert response.status == 200
+            return await response.json()
 
 
 def _write_package(folder, package, data):
