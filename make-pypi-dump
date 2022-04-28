@@ -87,10 +87,10 @@ async def _retrieve_and_write(session, semaphore, index, folder, package):
 async def _all(session, semaphore, index, folder, packages):
     tasks = [ asyncio.ensure_future(_retrieve_and_write(session, semaphore, index, folder, package)) for package in packages]
     results = await asyncio.gather(*tasks, return_exceptions=True)
-    return results
+    return await results
 
 
-def _get_and_write_data(folder, packages, index=INDEX):
+async def _get_and_write_data(folder, packages, index=INDEX):
     """Yield JSON information obtained from PyPI index given an iterable of package names.
 
     :param packages: Iterable of package names.
@@ -98,10 +98,10 @@ def _get_and_write_data(folder, packages, index=INDEX):
     """
     loop = asyncio.get_event_loop()
     connector = aiohttp.TCPConnector(loop=loop)
-    with aiohttp.ClientSession(loop=loop, connector=connector) as session:
+    async with aiohttp.ClientSession(loop=loop, connector=connector) as session:
         tasks = []
         sem = asyncio.Semaphore(NSEMAPHORE)
-        results = loop.run_until_complete(_all(session, sem, index, folder, packages))
+        results = await _all(session, sem, index, folder, packages)
         logging.info("Finished retrieved JSON from PyPI")
     loop.close()
     return zip(packages, results)
@@ -142,7 +142,7 @@ def dump(destination, update=False, index=INDEX):
     makefolder(data_folder, update)
 
     # List of tuples. First element is package name, and the second None or an exception.
-    results = _get_and_write_data(data_folder, packages, index)
+    results = asyncio.run(_get_and_write_data(data_folder, packages, index))
 
     failed = list(map(lambda r: r[0], filter(lambda r: isinstance(r[1], Exception), results)))
     del results
