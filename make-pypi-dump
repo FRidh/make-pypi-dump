@@ -87,8 +87,7 @@ async def _retrieve_and_write(session, semaphore, index, folder, package):
 async def _all(session, semaphore, index, folder, packages):
     tasks = [asyncio.ensure_future(_retrieve_and_write(session, semaphore, index, folder, package)) for package in
              packages]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    return await results
+    return await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def _get_and_write_data(folder, packages, index=INDEX):
@@ -104,7 +103,6 @@ async def _get_and_write_data(folder, packages, index=INDEX):
         sem = asyncio.Semaphore(NSEMAPHORE)
         results = await _all(session, sem, index, folder, packages)
         logging.info("Finished retrieved JSON from PyPI")
-    loop.close()
     return zip(packages, results)
 
 
