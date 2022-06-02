@@ -7,9 +7,7 @@ import datetime
 import json
 import logging
 import os
-import string
 from xmlrpc.client import ServerProxy
-from concurrent.futures import ThreadPoolExecutor
 
 # external dependencies
 import aiohttp
@@ -72,25 +70,27 @@ async def _fetch_page(session, semaphore, index, package):
 def _write_package(folder, package, data):
     """Write JSON to file."""
     # We group files on first character of name.
-    #first_characters = package[:NCHARACTERS]
-    #if not os.path.exists(os.path.join(folder, first_characters)):
-        #os.makedirs(os.path.join(folder, first_characters))
+    # first_characters = package[:NCHARACTERS]
+    # if not os.path.exists(os.path.join(folder, first_characters)):
+    # os.makedirs(os.path.join(folder, first_characters))
 
     with open(os.path.join(folder, "{}.json".format(package)), 'w') as f:
         json.dump(data, f, indent=2, sort_keys=True)
+
 
 async def _retrieve_and_write(session, semaphore, index, folder, package):
     json = await _fetch_page(session, semaphore, index, package)
     _write_package(folder, package, json)
     logging.debug("Finished with {}".format(package))
 
+
 async def _all(session, semaphore, index, folder, packages):
-    tasks = [ asyncio.ensure_future(_retrieve_and_write(session, semaphore, index, folder, package)) for package in packages]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    return results
+    tasks = [asyncio.ensure_future(_retrieve_and_write(session, semaphore, index, folder, package)) for package in
+             packages]
+    return await asyncio.gather(*tasks, return_exceptions=True)
 
 
-def _get_and_write_data(folder, packages, index=INDEX):
+async def _get_and_write_data(folder, packages, index=INDEX):
     """Yield JSON information obtained from PyPI index given an iterable of package names.
 
     :param packages: Iterable of package names.
@@ -98,13 +98,13 @@ def _get_and_write_data(folder, packages, index=INDEX):
     """
     loop = asyncio.get_event_loop()
     connector = aiohttp.TCPConnector(loop=loop)
-    with aiohttp.ClientSession(loop=loop, connector=connector) as session:
+    async with aiohttp.ClientSession(loop=loop, connector=connector) as session:
         tasks = []
         sem = asyncio.Semaphore(NSEMAPHORE)
-        results = loop.run_until_complete(_all(session, sem, index, folder, packages))
+        results = await _all(session, sem, index, folder, packages)
         logging.info("Finished retrieved JSON from PyPI")
-    loop.close()
     return zip(packages, results)
+
 
 def makefolder(destination, update):
     if os.path.exists(destination):
@@ -113,8 +113,8 @@ def makefolder(destination, update):
     else:
         os.makedirs(destination)
 
-def dump(destination, update=False, index=INDEX):
 
+def dump(destination, update=False, index=INDEX):
     # Create destination root folder.
     makefolder(destination, update)
 
@@ -124,15 +124,15 @@ def dump(destination, update=False, index=INDEX):
             state = json.load(f)
     else:
         state = {
-            'timestamp' :   None,
-            'failed'  :   [],
+            'timestamp': None,
+            'failed': [],
         }
 
     # Obtain list of packages to update/retrieve
     packages, timestamp = retrieve_packages_changelog(INDEX, state['timestamp'])
 
     # Include packages that could not be retrieved last time.
-    packages = sorted(list(set(packages+state['failed'])))
+    packages = sorted(list(set(packages + state['failed'])))
 
     npackages = len(packages)
     logging.info("Updating {} packages.".format(npackages))
@@ -142,15 +142,15 @@ def dump(destination, update=False, index=INDEX):
     makefolder(data_folder, update)
 
     # List of tuples. First element is package name, and the second None or an exception.
-    results = _get_and_write_data(data_folder, packages, index)
+    results = asyncio.run(_get_and_write_data(data_folder, packages, index))
 
     failed = list(map(lambda r: r[0], filter(lambda r: isinstance(r[1], Exception), results)))
     del results
 
     # State that we record.
     state = {
-        'timestamp' :   timestamp,
-        'failed'    :   failed
+        'timestamp': timestamp,
+        'failed': failed
     }
 
     with open(os.path.join(destination, FILE_STATE), 'w') as f:
@@ -165,7 +165,6 @@ def main():
     args = parser.parse_args()
 
     dump(args.destination, args.update)
-
 
 
 if __name__ == '__main__':
